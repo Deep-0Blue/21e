@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 """
-Force system DNS to Cloudflare 1.1.1.1 (IPv4).
+Force DNS to Cloudflare 1.1.1.1 (IPv4).
 
-Requires root: sudo python3 force_dns_cloudflare.py
+- Windows: no admin required. Tries adapter DNS without elevation; if blocked,
+  runs a local forwarder on 127.0.0.1 that proxies to 1.1.1.1.
+- Linux: requires root (sudo).
 """
 
 from __future__ import annotations
 
+import argparse
 import os
+import platform
 import shutil
+import socket
+import struct
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 CLOUDFLARE_DNS = "1.1.1.1"
+UPSTREAM = (CLOUDFLARE_DNS, 53)
 RESOLV_CONF = Path("/etc/resolv.conf")
 RESOLV_CONTENT = f"""# Force-set by force_dns_cloudflare.py
 nameserver {CLOUDFLARE_DNS}
@@ -21,19 +29,7 @@ nameserver {CLOUDFLARE_DNS}
 
 
 def run(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=check,
-    )
-
-
-def need_root() -> None:
-    if os.geteuid() != 0:
-        print("This script must run as root. Try:", file=sys.stderr)
-        print(f"  sudo {sys.executable} {Path(__file__).resolve()}", file=sys.stderr)
-        sys.exit(1)
+    return subprocess.run(cmd, capture_output=True, text=True, check=check)
 
 
 def log(msg: str) -> None:
@@ -46,6 +42,283 @@ def warn(msg: str) -> None:
 
 def has(cmd: str) -> bool:
     return shutil.which(cmd) is not None
+
+
+def is_windows() -> bool:
+    return platform.system() == "Windows"
+
+
+def is_admin_windows() -> bool:
+    if not is_windows():
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+# --- Windows (no admin required to run) -------------------------------------
+
+
+def powershell(script: str) -> subprocess.CompletedProcess[str]:
+    return run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ]
+    )
+
+
+def try_set_dns_windows_adapter() -> bool:
+    """Try to set adapter DNS without prompting for UAC. Often denied for standard users."""
+    ps = rf"""
+$dns = "{CLOUDFLARE_DNS}"
+$ok = $false
+Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.Status -eq 'Up' }} |
+  ForEach-Object {{
+    try {{
+      Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses $dns -ErrorAction Stop
+      $ok = $true
+      Write-Output "set:$($_.Name)"
+    }} catch {{
+      Write-Output "denied:$($_.Name):$($_.Exception.Message)"
+    }}
+  }}
+if ($ok) {{ exit 0 }} else {{ exit 1 }}
+"""
+    r = powershell(ps)
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("set:"):
+            log(f"Adapter DNS set: {line[4:]}")
+        elif line.startswith("denied:"):
+            warn(f"Could not set adapter '{line.split(':', 2)[1]}' (no permission)")
+    if r.returncode == 0:
+        run(["ipconfig", "/flushdns"])
+        return True
+    return False
+
+
+def try_set_dns_windows_netsh() -> bool:
+    r = run(["netsh", "interface", "ipv4", "show", "interfaces"])
+    if r.returncode != 0:
+        return False
+    ok = False
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0].isdigit() and parts[1] == "connected":
+            idx = parts[0]
+            rr = run(
+                [
+                    "netsh",
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "dns",
+                    f"name={idx}",
+                    "source=static",
+                    f"address={CLOUDFLARE_DNS}",
+                    "register=primary",
+                ]
+            )
+            if rr.returncode == 0:
+                log(f"netsh: DNS on interface index {idx}")
+                ok = True
+    if ok:
+        run(["ipconfig", "/flushdns"])
+    return ok
+
+
+def try_set_dns_windows_registry() -> bool:
+    """Per-adapter NameServer under HKLM — usually needs admin; try anyway."""
+    ps = rf"""
+$dns = "{CLOUDFLARE_DNS}"
+$path = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+$ok = $false
+if (-not (Test-Path $path)) {{ exit 1 }}
+Get-ChildItem $path | ForEach-Object {{
+  try {{
+    Set-ItemProperty -Path $_.PSPath -Name NameServer -Value $dns -ErrorAction Stop
+    $ok = $true
+    Write-Output "reg:$($_.PSChildName)"
+  }} catch {{ }}
+}}
+if ($ok) {{ exit 0 }} else {{ exit 1 }}
+"""
+    r = powershell(ps)
+    if r.returncode == 0:
+        for line in (r.stdout or "").splitlines():
+            if line.strip().startswith("reg:"):
+                log(f"Registry DNS: {line.strip()[4:]}")
+        run(["ipconfig", "/flushdns"])
+        return True
+    return False
+
+
+def verify_windows_adapter() -> bool:
+    ps = rf"""
+$dns = "{CLOUDFLARE_DNS}"
+(Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.ServerAddresses -contains $dns }} |
+  Measure-Object).Count -gt 0
+"""
+    r = powershell(ps)
+    return r.returncode == 0 and (r.stdout or "").strip().lower() == "true"
+
+
+def dns_query_udp(server: str, qname: str, port: int = 53) -> bool:
+    """Send A-record query to server; return True if we get a plausible response."""
+    label_parts = qname.strip(".").split(".")
+    qname_enc = b"".join(bytes([len(p)]) + p.encode() for p in label_parts) + b"\x00"
+    header = struct.pack("!HHHHHH", 0xABCD, 0x0100, 1, 0, 0, 0)
+    packet = header + qname_enc + struct.pack("!HH", 1, 1)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(3)
+    try:
+        sock.sendto(packet, (server, port))
+        data, _ = sock.recvfrom(4096)
+        return len(data) > 12 and struct.unpack("!H", data[2:4])[0] & 0x0F == 0
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+class DnsForwarder:
+    """UDP DNS proxy: listen locally, forward to Cloudflare 1.1.1.1."""
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 53) -> None:
+        self.host = host
+        self.port = port
+        self._sock: socket.socket | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> int:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for candidate in (self.port, 5353, 53535):
+            try:
+                self._sock.bind((self.host, candidate))
+                self.port = candidate
+                break
+            except OSError:
+                continue
+        else:
+            raise OSError(f"Could not bind DNS forwarder on {self.host}")
+
+        t = threading.Thread(target=self._serve, daemon=True)
+        t.start()
+        return self.port
+
+    def _serve(self) -> None:
+        assert self._sock is not None
+        upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        upstream.settimeout(5)
+        while not self._stop.is_set():
+            try:
+                data, addr = self._sock.recvfrom(4096)
+            except OSError:
+                break
+            try:
+                upstream.sendto(data, UPSTREAM)
+                reply, _ = upstream.recvfrom(4096)
+                self._sock.sendto(reply, addr)
+            except OSError:
+                pass
+        upstream.close()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._sock:
+            self._sock.close()
+
+
+def force_dns_windows(forwarder_only: bool) -> int:
+    print(f"Forcing DNS to Cloudflare {CLOUDFLARE_DNS} (Windows, no UAC prompt)\n")
+
+    if is_admin_windows():
+        log("Running elevated — adapter change is more likely to succeed.")
+    else:
+        log("Running as standard user — skipping elevation prompts.")
+
+    changed = False
+    if not forwarder_only:
+        changed = (
+            try_set_dns_windows_adapter()
+            or try_set_dns_windows_netsh()
+            or try_set_dns_windows_registry()
+        )
+        if verify_windows_adapter():
+            log("System adapter DNS reports 1.1.1.1")
+            if dns_query_udp(CLOUDFLARE_DNS, "cloudflare.com"):
+                print(f"\nDone. System DNS is {CLOUDFLARE_DNS}.")
+                return 0
+
+    forwarder = DnsForwarder()
+    try:
+        port = forwarder.start()
+    except OSError as e:
+        warn(f"Could not start local DNS forwarder: {e}")
+        return 1
+
+    log(f"Local DNS forwarder: {forwarder.host}:{port} -> {CLOUDFLARE_DNS}")
+
+    if not changed and port != 53:
+        warn(
+            "Could not change adapter DNS without admin. "
+            "Settings → Network → your connection → DNS → Manual → 127.0.0.1 "
+            f"(only works if your PC allows editing DNS without admin). "
+            f"Forwarder is on port {port}, not 53."
+        )
+    elif not changed:
+        log("Trying to point adapters at local forwarder (127.0.0.1)...")
+        ps = r"""
+$dns = "127.0.0.1"
+Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+  Where-Object { $_.Status -eq 'Up' } |
+  ForEach-Object {
+    try {
+      Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses $dns -ErrorAction Stop
+    } catch { }
+  }
+"""
+        powershell(ps)
+
+    target = forwarder.host if port == 53 else CLOUDFLARE_DNS
+    check_port = port if port != 53 else 53
+    if dns_query_udp(target, "cloudflare.com", check_port) or dns_query_udp(
+        CLOUDFLARE_DNS, "cloudflare.com"
+    ):
+        print(
+            f"\nForwarder running. Queries via 127.0.0.1:{port} use {CLOUDFLARE_DNS}. "
+            "Press Ctrl+C to stop."
+        )
+        try:
+            threading.Event().wait()
+        except KeyboardInterrupt:
+            print()
+        forwarder.stop()
+        return 0
+
+    warn("Forwarder started but DNS check failed.")
+    forwarder.stop()
+    return 1
+
+
+# --- Linux (root) -----------------------------------------------------------
+
+
+def need_root_linux() -> None:
+    if os.geteuid() != 0:
+        print("On Linux this script must run as root. Try:", file=sys.stderr)
+        print(f"  sudo {sys.executable} {Path(__file__).resolve()}", file=sys.stderr)
+        sys.exit(1)
 
 
 def unstick_resolv_conf() -> None:
@@ -109,7 +382,7 @@ def via_resolvectl() -> bool:
         line = line.strip()
         if not line or line.startswith("Global") or line.startswith("Link"):
             continue
-        if line[0].isdigit():
+        if line and line[0].isdigit():
             continue
         iface = line.split()[0]
         log(f"resolvectl: DNS on {iface}")
@@ -133,14 +406,14 @@ def write_resolv_conf() -> None:
         log("Made /etc/resolv.conf immutable (+i) — use chattr -i to undo")
 
 
-def flush_caches() -> None:
+def flush_caches_linux() -> None:
     if has("resolvectl"):
         run(["resolvectl", "flush-caches"])
     if has("systemctl") and has("nscd"):
         run(["systemctl", "restart", "nscd"])
 
 
-def verify() -> bool:
+def verify_linux() -> bool:
     if not RESOLV_CONF.exists():
         return False
     text = RESOLV_CONF.read_text(encoding="utf-8", errors="replace")
@@ -156,21 +429,33 @@ def verify() -> bool:
     return True
 
 
-def main() -> int:
-    need_root()
+def force_dns_linux() -> int:
+    need_root_linux()
     print(f"Forcing DNS to Cloudflare {CLOUDFLARE_DNS}\n")
-
     stop_dns_overwriters()
     via_network_manager()
     via_resolvectl()
     write_resolv_conf()
-    flush_caches()
-
-    if verify():
+    flush_caches_linux()
+    if verify_linux():
         print(f"\nDone. DNS should be {CLOUDFLARE_DNS}.")
         return 0
     warn("\nWrote config but verification was inconclusive.")
     return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Force DNS to Cloudflare 1.1.1.1")
+    parser.add_argument(
+        "--forwarder-only",
+        action="store_true",
+        help="Windows: skip adapter changes, only run local 1.1.1.1 forwarder",
+    )
+    args = parser.parse_args()
+
+    if is_windows():
+        return force_dns_windows(args.forwarder_only)
+    return force_dns_linux()
 
 
 if __name__ == "__main__":
