@@ -28,7 +28,7 @@ CLOUDFLARE_DNS_SECONDARY = "1.0.0.1"
 CLOUDFLARE_DNS_SERVERS = (CLOUDFLARE_DNS_PRIMARY, CLOUDFLARE_DNS_SECONDARY)
 CLOUDFLARE_DNS = CLOUDFLARE_DNS_PRIMARY
 DEFAULT_WINDOWS_ADAPTER = "Wi-Fi"
-WINDOWS_ADAPTER_ALIASES = ("Wi-Fi", "WLAN", "Wireless Network Connection")
+WINDOWS_ADAPTER_ALIASES = ("Wireless Network Connection", "Wi-Fi", "WLAN")
 UPSTREAM = (CLOUDFLARE_DNS_PRIMARY, 53)
 RESOLV_CONF = Path("/etc/resolv.conf")
 RESOLV_CONTENT = """# Force-set by force_dns_cloudflare.py
@@ -53,6 +53,9 @@ def windows_adapter_aliases(adapter: str) -> tuple[str, ...]:
 
 def ps_adapter_array_literal(adapter: str) -> str:
     return ", ".join(f'"{a}"' for a in windows_adapter_aliases(adapter))
+
+
+
 
 def run(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True, check=check)
@@ -172,22 +175,31 @@ def apply_dns_windows_once(forwarder_only: bool, adapter: str) -> bool:
     apply_wininet_hkcu()
     if forwarder_only:
         return False
-    return (
-        try_set_dns_windows_adapter(adapter)
-        or try_set_dns_windows_netsh(adapter)
-        or try_set_dns_windows_registry()
-    )
+    ps_ok = try_set_dns_windows_adapter(adapter)
+    netsh_ok = try_set_dns_windows_netsh(adapter)
+    reg_ok = try_set_dns_windows_registry()
+    return ps_ok or netsh_ok or reg_ok
 
 
 def persist_dns_loop(interval: float, forwarder_only: bool, adapter: str) -> None:
     log(f"Persist mode on '{adapter}': re-applying every {interval}s (Ctrl+C to stop)")
+    log("Set-DnsClientServerAddress 'denied' is normal on LWSD — netsh may still apply DNS.")
+    tick = 0
     while True:
         apply_dns_windows_once(forwarder_only, adapter)
         flush_dns_cache_windows()
+        tick += 1
+        ok = cloudflare_dns_active(adapter)
+        flag = "OK" if ok else "not Cloudflare yet"
         print(
-            f"dns -> {', '.join(CLOUDFLARE_DNS_SERVERS)} @ "
+            f"[{flag}] {format_dns_status(adapter)} @ "
             f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
+        if not ok and tick in (1, 20, 40):
+            warn(
+                "Still on district DNS? Settings → Wi-Fi → LWSD-WLAN → DNS → Manual → "
+                "1.1.1.1 and 1.0.0.1, then keep this script running."
+            )
         time.sleep(interval)
 
 
@@ -204,6 +216,48 @@ def powershell(script: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+
+def discover_windows_wifi_adapter() -> str:
+    ps = """
+$nic = Get-NetAdapter -ErrorAction SilentlyContinue |
+  Where-Object { $_.Status -eq 'Up' -and ($_.Name -match 'Wi-?Fi|WLAN|Wireless') } |
+  Sort-Object { if ($_.Name -eq 'Wi-Fi') { 0 } elseif ($_.Name -match 'Wireless') { 1 } else { 2 } } |
+  Select-Object -First 1 -ExpandProperty Name
+if ($nic) { $nic } else { 'Wi-Fi' }
+"""
+    r = powershell(ps.strip())
+    if r.stdout and r.stdout.strip():
+        return r.stdout.strip().splitlines()[0].strip()
+    return DEFAULT_WINDOWS_ADAPTER
+
+
+def get_windows_dns_servers(adapter: str) -> list[str]:
+    ps = rf"""
+(Get-DnsClientServerAddress -InterfaceAlias "{adapter}" -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
+"""
+    r = powershell(ps)
+    if not (r.stdout or "").strip():
+        return []
+    return [s.strip() for s in r.stdout.split() if s.strip()]
+
+
+def format_dns_status(adapter: str) -> str:
+    addrs = get_windows_dns_servers(adapter)
+    if not addrs:
+        return f"{adapter}: (DHCP — may show district DNS in Settings)"
+    return f"{adapter}: {', '.join(addrs)}"
+
+
+def parse_denied_line(line: str) -> tuple[str, str] | None:
+    parts = line.split(":", 2)
+    if len(parts) < 3 or parts[0] != "denied":
+        return None
+    return parts[1], parts[2]
+
+
+def cloudflare_dns_active(adapter: str) -> bool:
+    addrs = get_windows_dns_servers(adapter)
+    return bool(addrs) and all(ip in addrs for ip in CLOUDFLARE_DNS_SERVERS)
 def try_set_dns_windows_adapter(adapter: str = DEFAULT_WINDOWS_ADAPTER) -> bool:
     """Set Cloudflare DNS on Wi-Fi (and aliases); fallback to any up physical adapter."""
     dns_lit = ps_dns_array_literal()
@@ -240,12 +294,21 @@ if (-not $ok) {{
 if ($ok) {{ exit 0 }} else {{ exit 1 }}
 """
     r = powershell(ps)
+    denied: list[str] = []
     for line in (r.stdout or "").splitlines():
         line = line.strip()
         if line.startswith("set:"):
             log(f"Adapter DNS set: {line[4:]} -> {', '.join(CLOUDFLARE_DNS_SERVERS)}")
-        elif line.startswith("denied:"):
-            warn(f"Could not set adapter '{line.split(':', 2)[1]}' (no permission)")
+            continue
+        parsed = parse_denied_line(line)
+        if parsed and parsed[0] and parsed[0] not in denied:
+            denied.append(parsed[0])
+    if denied and r.returncode != 0:
+        log(
+            "PowerShell DNS blocked on: "
+            + ", ".join(denied)
+            + " (try netsh / Settings — not a fatal error)"
+        )
     if r.returncode == 0:
         run(["ipconfig", "/flushdns"])
         return True
@@ -423,14 +486,24 @@ def force_dns_windows(
     else:
         log("Running as standard user — skipping elevation prompts.")
 
+    if adapter == DEFAULT_WINDOWS_ADAPTER:
+        adapter = discover_windows_wifi_adapter()
+    log(f"Adapter: {adapter}")
+    print(f"Current DNS: {format_dns_status(adapter)}\n")
+
     if persist:
-        forwarder = DnsForwarder()
+        forwarder = None
         try:
-            port = forwarder.start()
-            log(f"Background forwarder: 127.0.0.1:{port} -> {CLOUDFLARE_DNS}")
+            f = DnsForwarder()
+            port = f.start()
+            if port == 53:
+                forwarder = f
+                log(f"Forwarder 127.0.0.1:53 -> {CLOUDFLARE_DNS_PRIMARY}")
+            else:
+                f.stop()
+                log(f"Skipping forwarder on port {port} (Windows uses DNS port 53 only)")
         except OSError as e:
-            warn(f"Forwarder failed to start: {e}")
-            forwarder = None
+            warn(f"Forwarder not started: {e}")
         try:
             persist_dns_loop(interval, forwarder_only, adapter)
         except KeyboardInterrupt:
