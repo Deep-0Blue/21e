@@ -564,8 +564,50 @@ def force_dns_linux() -> int:
     return 1
 
 
+
+def print_startup_check() -> int:
+    """Print environment info for PowerShell troubleshooting."""
+    print("=== force_dns_cloudflare.py --check ===\n")
+    print(f"Python:     {sys.executable}")
+    print(f"Version:    {sys.version.split()[0]}")
+    print(f"Platform:   {platform.platform()}")
+    print(f"Script:     {Path(__file__).resolve()}")
+    print(f"Cloudflare: {CLOUDFLARE_DNS}\n")
+
+    if not is_windows():
+        warn("This machine is not Windows - adapter/HKCU logic is for Windows only.")
+        print("On Linux use: sudo python3 force_dns_cloudflare.py")
+        return 1
+
+    print(f"Admin:      {is_admin_windows()}")
+    for cmd in ("powershell", "netsh", "ipconfig"):
+        print(f"  {cmd + ':':12} {'yes' if has(cmd) else 'MISSING'}")
+
+    try:
+        _winreg()
+        print("  winreg:     ok")
+    except Exception as e:
+        warn(f"winreg:     {e}")
+
+    if is_windows():
+        r = powershell("Get-NetAdapter | Select-Object -First 1 Name,Status")
+        print(f"\nNetAdapter sample (exit {r.returncode}):")
+        print((r.stdout or r.stderr or "(no output)")[:500])
+
+    print("\nRun persist loop:")
+    print(f'  python "{Path(__file__).name}" --persist')
+    print("Or:")
+    print('  powershell -ExecutionPolicy Bypass -File .\run-dns.ps1')
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Force DNS to Cloudflare 1.1.1.1")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Print environment diagnostics and exit",
+    )
     parser.add_argument(
         "--forwarder-only",
         action="store_true",
@@ -583,6 +625,9 @@ def main() -> int:
         help="Seconds between persist loop iterations (default: 0.5)",
     )
     args = parser.parse_args()
+
+    if args.check:
+        return print_startup_check()
 
     if is_windows():
         return force_dns_windows(args.forwarder_only, args.persist, args.interval)
