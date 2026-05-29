@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Force DNS to Cloudflare 1.1.1.1 (IPv4).
+Force DNS to Cloudflare 1.1.1.1 and 1.0.0.1.
 
 - Windows: no admin. HKCU Internet Settings\\Connections registry patches
   (DefaultConnectionSettings), adapter DNS attempts, optional --persist loop,
@@ -23,13 +23,36 @@ import sys
 import threading
 from pathlib import Path
 
-CLOUDFLARE_DNS = "1.1.1.1"
-UPSTREAM = (CLOUDFLARE_DNS, 53)
+CLOUDFLARE_DNS_PRIMARY = "1.1.1.1"
+CLOUDFLARE_DNS_SECONDARY = "1.0.0.1"
+CLOUDFLARE_DNS_SERVERS = (CLOUDFLARE_DNS_PRIMARY, CLOUDFLARE_DNS_SECONDARY)
+CLOUDFLARE_DNS = CLOUDFLARE_DNS_PRIMARY
+DEFAULT_WINDOWS_ADAPTER = "Wi-Fi"
+WINDOWS_ADAPTER_ALIASES = ("Wi-Fi", "WLAN", "Wireless Network Connection")
+UPSTREAM = (CLOUDFLARE_DNS_PRIMARY, 53)
 RESOLV_CONF = Path("/etc/resolv.conf")
-RESOLV_CONTENT = f"""# Force-set by force_dns_cloudflare.py
-nameserver {CLOUDFLARE_DNS}
+RESOLV_CONTENT = """# Force-set by force_dns_cloudflare.py
+nameserver 1.1.1.1
+nameserver 1.0.0.1
 """
 
+
+
+
+def ps_dns_array_literal() -> str:
+    return ", ".join(f'"{ip}"' for ip in CLOUDFLARE_DNS_SERVERS)
+
+
+def windows_adapter_aliases(adapter: str) -> tuple[str, ...]:
+    seen: list[str] = []
+    for name in (adapter, *WINDOWS_ADAPTER_ALIASES):
+        if name not in seen:
+            seen.append(name)
+    return tuple(seen)
+
+
+def ps_adapter_array_literal(adapter: str) -> str:
+    return ", ".join(f'"{a}"' for a in windows_adapter_aliases(adapter))
 
 def run(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True, check=check)
@@ -145,24 +168,24 @@ def flush_dns_cache_windows() -> None:
     run(["ipconfig", "/flushdns"])
 
 
-def apply_dns_windows_once(forwarder_only: bool) -> bool:
+def apply_dns_windows_once(forwarder_only: bool, adapter: str) -> bool:
     apply_wininet_hkcu()
     if forwarder_only:
         return False
     return (
-        try_set_dns_windows_adapter()
-        or try_set_dns_windows_netsh()
+        try_set_dns_windows_adapter(adapter)
+        or try_set_dns_windows_netsh(adapter)
         or try_set_dns_windows_registry()
     )
 
 
-def persist_dns_loop(interval: float, forwarder_only: bool) -> None:
-    log(f"Persist mode: re-applying every {interval}s (Ctrl+C to stop)")
+def persist_dns_loop(interval: float, forwarder_only: bool, adapter: str) -> None:
+    log(f"Persist mode on '{adapter}': re-applying every {interval}s (Ctrl+C to stop)")
     while True:
-        apply_dns_windows_once(forwarder_only)
+        apply_dns_windows_once(forwarder_only, adapter)
         flush_dns_cache_windows()
         print(
-            f"dns -> {CLOUDFLARE_DNS} @ "
+            f"dns -> {', '.join(CLOUDFLARE_DNS_SERVERS)} @ "
             f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         time.sleep(interval)
@@ -181,29 +204,46 @@ def powershell(script: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def try_set_dns_windows_adapter() -> bool:
-    """Try to set adapter DNS without prompting for UAC. Often denied for standard users."""
+def try_set_dns_windows_adapter(adapter: str = DEFAULT_WINDOWS_ADAPTER) -> bool:
+    """Set Cloudflare DNS on Wi-Fi (and aliases); fallback to any up physical adapter."""
+    dns_lit = ps_dns_array_literal()
+    alias_lit = ps_adapter_array_literal(adapter)
     ps = rf"""
-$dns = "{CLOUDFLARE_DNS}"
+$dns = @({dns_lit})
+$aliases = @({alias_lit})
 $ok = $false
-Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
-  Where-Object {{ $_.Status -eq 'Up' }} |
-  ForEach-Object {{
-    try {{
-      Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses $dns -ErrorAction Stop
-      $ok = $true
-      Write-Output "set:$($_.Name)"
-    }} catch {{
-      Write-Output "denied:$($_.Name):$($_.Exception.Message)"
-    }}
+foreach ($alias in $aliases) {{
+  $nic = Get-NetAdapter -Name $alias -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.Status -eq 'Up' }} | Select-Object -First 1
+  if (-not $nic) {{ continue }}
+  try {{
+    Set-DnsClientServerAddress -InterfaceAlias $nic.Name -ServerAddresses $dns -ErrorAction Stop
+    $ok = $true
+    Write-Output "set:$($nic.Name)"
+  }} catch {{
+    Write-Output "denied:$($nic.Name):$($_.Exception.Message)"
   }}
+}}
+if (-not $ok) {{
+  Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.Status -eq 'Up' }} |
+    ForEach-Object {{
+      try {{
+        Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses $dns -ErrorAction Stop
+        $ok = $true
+        Write-Output "set:$($_.Name)"
+      }} catch {{
+        Write-Output "denied:$($_.Name):$($_.Exception.Message)"
+      }}
+    }}
+}}
 if ($ok) {{ exit 0 }} else {{ exit 1 }}
 """
     r = powershell(ps)
     for line in (r.stdout or "").splitlines():
         line = line.strip()
         if line.startswith("set:"):
-            log(f"Adapter DNS set: {line[4:]}")
+            log(f"Adapter DNS set: {line[4:]} -> {', '.join(CLOUDFLARE_DNS_SERVERS)}")
         elif line.startswith("denied:"):
             warn(f"Could not set adapter '{line.split(':', 2)[1]}' (no permission)")
     if r.returncode == 0:
@@ -212,30 +252,49 @@ if ($ok) {{ exit 0 }} else {{ exit 1 }}
     return False
 
 
-def try_set_dns_windows_netsh() -> bool:
+def try_set_dns_windows_netsh(adapter: str = DEFAULT_WINDOWS_ADAPTER) -> bool:
+    ok = False
+    for name in windows_adapter_aliases(adapter):
+        rr = run(
+            [
+                "netsh", "interface", "ipv4", "set", "dns",
+                f'name="{name}"', "static", CLOUDFLARE_DNS_PRIMARY, "primary",
+            ]
+        )
+        if rr.returncode == 0:
+            run(
+                [
+                    "netsh", "interface", "ipv4", "add", "dns",
+                    f'name="{name}"', CLOUDFLARE_DNS_SECONDARY, "index=2",
+                ]
+            )
+            log(f"netsh: {name} -> {', '.join(CLOUDFLARE_DNS_SERVERS)}")
+            ok = True
+    if ok:
+        run(["ipconfig", "/flushdns"])
+        return True
     r = run(["netsh", "interface", "ipv4", "show", "interfaces"])
     if r.returncode != 0:
         return False
-    ok = False
     for line in r.stdout.splitlines():
         parts = line.split()
         if len(parts) >= 5 and parts[0].isdigit() and parts[1] == "connected":
             idx = parts[0]
             rr = run(
                 [
-                    "netsh",
-                    "interface",
-                    "ipv4",
-                    "set",
-                    "dns",
-                    f"name={idx}",
-                    "source=static",
-                    f"address={CLOUDFLARE_DNS}",
-                    "register=primary",
+                    "netsh", "interface", "ipv4", "set", "dns",
+                    f"name={idx}", "source=static",
+                    f"address={CLOUDFLARE_DNS_PRIMARY}", "register=primary",
                 ]
             )
             if rr.returncode == 0:
-                log(f"netsh: DNS on interface index {idx}")
+                run(
+                    [
+                        "netsh", "interface", "ipv4", "add", "dns",
+                        f"name={idx}", CLOUDFLARE_DNS_SECONDARY, "index=2",
+                    ]
+                )
+                log(f"netsh: interface index {idx}")
                 ok = True
     if ok:
         run(["ipconfig", "/flushdns"])
@@ -245,13 +304,12 @@ def try_set_dns_windows_netsh() -> bool:
 def try_set_dns_windows_registry() -> bool:
     """Per-adapter NameServer under HKLM — usually needs admin; try anyway."""
     ps = rf"""
-$dns = "{CLOUDFLARE_DNS}"
 $path = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
 $ok = $false
 if (-not (Test-Path $path)) {{ exit 1 }}
 Get-ChildItem $path | ForEach-Object {{
   try {{
-    Set-ItemProperty -Path $_.PSPath -Name NameServer -Value $dns -ErrorAction Stop
+    Set-ItemProperty -Path $_.PSPath -Name NameServer -Value "1.1.1.1,1.0.0.1" -ErrorAction Stop
     $ok = $true
     Write-Output "reg:$($_.PSChildName)"
   }} catch {{ }}
@@ -268,15 +326,22 @@ if ($ok) {{ exit 0 }} else {{ exit 1 }}
     return False
 
 
-def verify_windows_adapter() -> bool:
+def verify_windows_adapter(adapter: str = DEFAULT_WINDOWS_ADAPTER) -> bool:
+    dns_lit = ps_dns_array_literal()
     ps = rf"""
-$dns = "{CLOUDFLARE_DNS}"
-(Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-  Where-Object {{ $_.ServerAddresses -contains $dns }} |
-  Measure-Object).Count -gt 0
+$want = @({dns_lit})
+$addrs = (Get-DnsClientServerAddress -InterfaceAlias "{adapter}" -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
+if ($addrs) {{
+  ($want | Where-Object {{ $addrs -contains $_ }}).Count -eq $want.Count
+}} else {{
+  (Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.ServerAddresses -contains $want[0] }} |
+    Measure-Object).Count -gt 0
+}}
 """
     r = powershell(ps)
     return r.returncode == 0 and (r.stdout or "").strip().lower() == "true"
+
 
 
 def dns_query_udp(server: str, qname: str, port: int = 53) -> bool:
@@ -349,8 +414,9 @@ def force_dns_windows(
     forwarder_only: bool,
     persist: bool,
     interval: float,
+    adapter: str,
 ) -> int:
-    print(f"Forcing DNS to Cloudflare {CLOUDFLARE_DNS} (Windows, no UAC prompt)\n")
+    print(f"Forcing Cloudflare DNS {", ".join(CLOUDFLARE_DNS_SERVERS)} on '{adapter}' (no UAC)\n")
 
     if is_admin_windows():
         log("Running elevated — adapter change is more likely to succeed.")
@@ -366,16 +432,16 @@ def force_dns_windows(
             warn(f"Forwarder failed to start: {e}")
             forwarder = None
         try:
-            persist_dns_loop(interval, forwarder_only)
+            persist_dns_loop(interval, forwarder_only, adapter)
         except KeyboardInterrupt:
             print()
             if forwarder:
                 forwarder.stop()
         return 0
 
-    changed = apply_dns_windows_once(forwarder_only)
-    if verify_windows_adapter():
-        log("System adapter DNS reports 1.1.1.1")
+    changed = apply_dns_windows_once(forwarder_only, adapter)
+    if verify_windows_adapter(adapter):
+        log(f"'{adapter}' reports Cloudflare DNS")
         if dns_query_udp(CLOUDFLARE_DNS, "cloudflare.com"):
             print(f"\nDone. System DNS is {CLOUDFLARE_DNS}.")
             return 0
@@ -398,15 +464,14 @@ def force_dns_windows(
         )
     elif not changed:
         log("Trying to point adapters at local forwarder (127.0.0.1)...")
-        ps = r"""
+        alias_lit = ps_adapter_array_literal(adapter)
+        ps = rf"""
 $dns = "127.0.0.1"
-Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
-  Where-Object { $_.Status -eq 'Up' } |
-  ForEach-Object {
-    try {
-      Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses $dns -ErrorAction Stop
-    } catch { }
-  }
+foreach ($alias in @({alias_lit})) {{
+  try {{
+    Set-DnsClientServerAddress -InterfaceAlias $alias -ServerAddresses $dns -ErrorAction SilentlyContinue
+  }} catch {{ }}
+}}
 """
         powershell(ps)
 
@@ -480,7 +545,7 @@ def via_network_manager() -> bool:
                 "modify",
                 name,
                 "ipv4.dns",
-                CLOUDFLARE_DNS,
+                ",".join(CLOUDFLARE_DNS_SERVERS),
                 "ipv4.ignore-auto-dns",
                 "yes",
             ]
@@ -506,7 +571,7 @@ def via_resolvectl() -> bool:
             continue
         iface = line.split()[0]
         log(f"resolvectl: DNS on {iface}")
-        rr = run(["resolvectl", "dns", iface, CLOUDFLARE_DNS])
+        rr = run(["resolvectl", "dns", iface, *CLOUDFLARE_DNS_SERVERS])
         rr2 = run(["resolvectl", "domain", iface, "~."])
         ok = ok or rr.returncode == 0 or rr2.returncode == 0
     return ok
@@ -537,7 +602,7 @@ def verify_linux() -> bool:
     if not RESOLV_CONF.exists():
         return False
     text = RESOLV_CONF.read_text(encoding="utf-8", errors="replace")
-    if CLOUDFLARE_DNS not in text:
+    if CLOUDFLARE_DNS_PRIMARY not in text or CLOUDFLARE_DNS_SECONDARY not in text:
         warn(f"{RESOLV_CONF} does not list {CLOUDFLARE_DNS}")
         return False
     if has("getent"):
@@ -572,7 +637,8 @@ def print_startup_check() -> int:
     print(f"Version:    {sys.version.split()[0]}")
     print(f"Platform:   {platform.platform()}")
     print(f"Script:     {Path(__file__).resolve()}")
-    print(f"Cloudflare: {CLOUDFLARE_DNS}\n")
+    print(f"Cloudflare: {", ".join(CLOUDFLARE_DNS_SERVERS)}\n")
+    print(f"Adapter:    {DEFAULT_WINDOWS_ADAPTER} (use --adapter to override)\n")
 
     if not is_windows():
         warn("This machine is not Windows - adapter/HKCU logic is for Windows only.")
@@ -602,7 +668,7 @@ def print_startup_check() -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Force DNS to Cloudflare 1.1.1.1")
+    parser = argparse.ArgumentParser(description="Force DNS to Cloudflare 1.1.1.1 and 1.0.0.1")
     parser.add_argument(
         "--check",
         action="store_true",
@@ -619,6 +685,11 @@ def main() -> int:
         help="Windows: loop forever (HKCU registry + DNS), re-applying every --interval",
     )
     parser.add_argument(
+        "--adapter",
+        default=DEFAULT_WINDOWS_ADAPTER,
+        help='Windows adapter name (default: "Wi-Fi")',
+    )
+    parser.add_argument(
         "--interval",
         type=float,
         default=0.5,
@@ -630,7 +701,7 @@ def main() -> int:
         return print_startup_check()
 
     if is_windows():
-        return force_dns_windows(args.forwarder_only, args.persist, args.interval)
+        return force_dns_windows(args.forwarder_only, args.persist, args.interval, args.adapter)
     return force_dns_linux()
 
 
