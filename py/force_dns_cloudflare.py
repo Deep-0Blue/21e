@@ -2,15 +2,18 @@
 """
 Force DNS to Cloudflare 1.1.1.1 (IPv4).
 
-- Windows: no admin required. Tries adapter DNS without elevation; if blocked,
-  runs a local forwarder on 127.0.0.1 that proxies to 1.1.1.1.
+- Windows: no admin. HKCU Internet Settings\\Connections registry patches
+  (DefaultConnectionSettings), adapter DNS attempts, optional --persist loop,
+  and a 127.0.0.1 forwarder to 1.1.1.1.
 - Linux: requires root (sudo).
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
+import time
 import platform
 import shutil
 import socket
@@ -60,6 +63,109 @@ def is_admin_windows() -> bool:
 
 
 # --- Windows (no admin required to run) -------------------------------------
+
+INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+INTERNET_CONNECTIONS = INTERNET_SETTINGS + r"\Connections"
+PROXY_FLAGS_DIRECT = 0x1
+
+
+def _winreg():
+    import winreg
+    return winreg
+
+
+def patch_connection_settings_blob(value_name: str) -> bool:
+    """HKCU Connections blob: bump counter, set direct (0x1) proxy flags — no admin."""
+    winreg = _winreg()
+    access = winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, INTERNET_CONNECTIONS, 0, access) as key:
+            raw = winreg.QueryValueEx(key, value_name)[0]
+            settings = bytearray(raw)
+            if len(settings) < 0xC:
+                return False
+            settings[0x4:0x8] = (
+                int.from_bytes(settings[0x4:0x8], "little") + 1
+            ).to_bytes(4, "little")
+            settings[0x8:0xC] = PROXY_FLAGS_DIRECT.to_bytes(4, "little")
+            winreg.SetValueEx(key, value_name, 0, winreg.REG_BINARY, bytes(settings))
+        return True
+    except OSError:
+        return False
+
+
+def patch_all_connection_settings_blobs() -> int:
+    winreg = _winreg()
+    access = winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE
+    count = 0
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, INTERNET_CONNECTIONS, 0, access) as key:
+            i = 0
+            while True:
+                try:
+                    name, data, vtype = winreg.EnumValue(key, i)
+                except OSError:
+                    break
+                i += 1
+                if vtype != winreg.REG_BINARY or not isinstance(data, (bytes, bytearray)):
+                    continue
+                if len(data) < 0xC:
+                    continue
+                if patch_connection_settings_blob(name):
+                    count += 1
+    except OSError:
+        pass
+    return count
+
+
+def disable_inet_proxy_dwords() -> None:
+    winreg = _winreg()
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, INTERNET_SETTINGS, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            for name in ("ProxyEnable", "MigrateProxy"):
+                try:
+                    winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, 0)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def apply_wininet_hkcu() -> bool:
+    n = patch_all_connection_settings_blobs()
+    disable_inet_proxy_dwords()
+    if n:
+        log(f"HKCU connection settings patched ({n} blob(s), direct / no proxy)")
+    return n > 0
+
+
+def flush_dns_cache_windows() -> None:
+    run(["ipconfig", "/flushdns"])
+
+
+def apply_dns_windows_once(forwarder_only: bool) -> bool:
+    apply_wininet_hkcu()
+    if forwarder_only:
+        return False
+    return (
+        try_set_dns_windows_adapter()
+        or try_set_dns_windows_netsh()
+        or try_set_dns_windows_registry()
+    )
+
+
+def persist_dns_loop(interval: float, forwarder_only: bool) -> None:
+    log(f"Persist mode: re-applying every {interval}s (Ctrl+C to stop)")
+    while True:
+        apply_dns_windows_once(forwarder_only)
+        flush_dns_cache_windows()
+        print(
+            f"dns -> {CLOUDFLARE_DNS} @ "
+            f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        time.sleep(interval)
 
 
 def powershell(script: str) -> subprocess.CompletedProcess[str]:
@@ -239,7 +345,11 @@ class DnsForwarder:
             self._sock.close()
 
 
-def force_dns_windows(forwarder_only: bool) -> int:
+def force_dns_windows(
+    forwarder_only: bool,
+    persist: bool,
+    interval: float,
+) -> int:
     print(f"Forcing DNS to Cloudflare {CLOUDFLARE_DNS} (Windows, no UAC prompt)\n")
 
     if is_admin_windows():
@@ -247,18 +357,28 @@ def force_dns_windows(forwarder_only: bool) -> int:
     else:
         log("Running as standard user — skipping elevation prompts.")
 
-    changed = False
-    if not forwarder_only:
-        changed = (
-            try_set_dns_windows_adapter()
-            or try_set_dns_windows_netsh()
-            or try_set_dns_windows_registry()
-        )
-        if verify_windows_adapter():
-            log("System adapter DNS reports 1.1.1.1")
-            if dns_query_udp(CLOUDFLARE_DNS, "cloudflare.com"):
-                print(f"\nDone. System DNS is {CLOUDFLARE_DNS}.")
-                return 0
+    if persist:
+        forwarder = DnsForwarder()
+        try:
+            port = forwarder.start()
+            log(f"Background forwarder: 127.0.0.1:{port} -> {CLOUDFLARE_DNS}")
+        except OSError as e:
+            warn(f"Forwarder failed to start: {e}")
+            forwarder = None
+        try:
+            persist_dns_loop(interval, forwarder_only)
+        except KeyboardInterrupt:
+            print()
+            if forwarder:
+                forwarder.stop()
+        return 0
+
+    changed = apply_dns_windows_once(forwarder_only)
+    if verify_windows_adapter():
+        log("System adapter DNS reports 1.1.1.1")
+        if dns_query_udp(CLOUDFLARE_DNS, "cloudflare.com"):
+            print(f"\nDone. System DNS is {CLOUDFLARE_DNS}.")
+            return 0
 
     forwarder = DnsForwarder()
     try:
@@ -451,10 +571,21 @@ def main() -> int:
         action="store_true",
         help="Windows: skip adapter changes, only run local 1.1.1.1 forwarder",
     )
+    parser.add_argument(
+        "--persist",
+        action="store_true",
+        help="Windows: loop forever (HKCU registry + DNS), re-applying every --interval",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=0.5,
+        help="Seconds between persist loop iterations (default: 0.5)",
+    )
     args = parser.parse_args()
 
     if is_windows():
-        return force_dns_windows(args.forwarder_only)
+        return force_dns_windows(args.forwarder_only, args.persist, args.interval)
     return force_dns_linux()
 
 
