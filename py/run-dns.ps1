@@ -31,7 +31,7 @@ if (-not $python) {
 }
 
 Write-Host "Using: $python" -ForegroundColor DarkGray
-Write-Host "Target: 1.1.1.1 (Cloudflare). Leave this window open. Ctrl+C to stop." -ForegroundColor Cyan
+Write-Host "Target: 1.1.1.1 + 1.0.0.1 on Wi-Fi. Leave this window open. Ctrl+C to stop." -ForegroundColor Cyan
 Write-Host ""
 
 & $python $pyScript --persist @args
