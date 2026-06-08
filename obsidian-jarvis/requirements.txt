@@ -1,0 +1,5 @@
+# Obsidian Jarvis dependencies.
+# The pipeline runs end-to-end with no third-party packages (offline "dry" engine).
+# These are only needed when you enable a real LLM backend or YAML configs.
+PyYAML>=6.0
+requests>=2.31
