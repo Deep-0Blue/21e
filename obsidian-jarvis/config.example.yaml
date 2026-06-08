@@ -1,0 +1,27 @@
+# Obsidian Jarvis configuration (copy to config.yaml and edit).
+# Every value is optional except `vault`.
+
+# Path to your Obsidian vault (or any folder you want to use as one).
+vault: ./vault
+
+# Folder, relative to the vault, that Jarvis watches for new idea notes.
+inbox: 00-Inbox
+
+# Folder, relative to the vault, where finished projects are written.
+projects: 10-Projects
+
+# How often the `watch` command rescans the inbox, in seconds.
+poll_interval: 30
+
+# Max ideas processed per watcher tick (safety throttle).
+max_per_tick: 5
+
+# LLM backend:
+#   offline -> deterministic, no API key/network required (great for testing)
+#   openai  -> any OpenAI-compatible /chat/completions endpoint
+llm_backend: offline
+llm_model: gpt-4o-mini
+llm_base_url: https://api.openai.com/v1
+# Prefer setting the key via env var JARVIS_LLM_API_KEY or OPENAI_API_KEY:
+# llm_api_key: sk-...
+llm_temperature: 0.4

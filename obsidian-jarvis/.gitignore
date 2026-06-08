@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+config.yaml
+.jarvis/
+
+# Generated projects from the example vault (keep the inbox example only).
+vault/10-Projects/*
+!vault/10-Projects/.gitkeep
